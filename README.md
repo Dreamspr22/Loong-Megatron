@@ -1,5 +1,57 @@
 <div align="center">
 
+Loong-Megatron
+==============
+
+<h4>A fork of Megatron-LM serving as the backend training engine for LoongForge, with deep customizations in memory optimization and parallelism strategies.</h4>
+
+[![upstream](https://img.shields.io/badge/upstream-mcore__v0.15.0-blue)](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.15.0)
+[![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
+
+</div>
+
+> [!NOTE]
+> The current `loong-main/core_v0.15.0` branch is based on and optimized from the upstream release tag **[`core_v0.15.0`](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.15.0)**.
+
+## Maintenance Principles
+
+Loong-Megatron tracks recent upstream release versions of [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM). Each primary version is maintained on a dedicated `loong-main/core_v*` branch and updated promptly as the upstream evolves.
+
+- Modifications to the original codebase are added or removed in response to upstream changes. When an equivalent feature becomes available upstream and meets expectations, we default to adopting the upstream implementation.
+- Changes to upstream code should be made conservatively. Whenever possible, modifications are preferred in the upper-level codebase to reduce maintenance complexity.
+- Patches should primarily consist of bug fixes and new features; existing upstream capabilities should not be removed by default. Critical changes should be considered for contribution back to the upstream repository.
+
+## Key Modifications (including but not limited to)
+
+- **Variable-length sequence support**: Enable variable-length sequence training and introduce `--reduce-variable-seq-shape-p2p-comm` to reduce P2P communication overhead for variable-length data shapes.
+- **Multi-head MTP enhancements**: Support shared/independent head weights and cascaded/concatenated computation modes for Multi-Token Prediction (MTP).
+- **Loss mask fix**: Fix incorrect loss mask when `pad == eos`.
+- **Per-module precision control**: Support per-module FP32 precision override (e.g., `expert_bias`, `output_layer`) via `--use-fp32-dtype-for-param-pattern`, improving RL training precision.
+- **FP8 training convergence fix**: Avoid redundant re-quantization during weight loading to improve FP8 training precision and ensure convergence.
+- **All-to-All overlap refinement**: Refine All-to-All overlap behavior under `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+- **Tensor-granularity offload**: Add tensor-granularity offload with enhanced computation–All-to-All overlap, saving more memory compared to upstream.
+- **Extended selective recomputation**: Add finer recomputation granularity: `mlp_act`, `router_expert`, and `pre_mlp`.
+- **MFSDP fixes**:
+  - Fix compatibility between MFSDP and precision-aware optimizer.
+  - Fix parameter sharding edge case that could cause training errors.
+  - Fix gradient retrieval in MFSDP with precision-aware optimizer.
+- **Optimizer offload improvements**:
+  - Support optimizer offload when `--fp8-param-gather` is enabled.
+  - Fix precision issues when resuming from checkpoint with BF16 and optimizer offload.
+  - Support BF16 precision optimizer storing BF16 checkpoints.
+  - Integrate DeepSpeed CPUAdam kernel to accelerate optimizer offload parameter updates (disable via `--no-use-deepspeed-cpu-adam`).
+- **Muon Optimizer**: Cherry-pick Muon Optimizer support.
+- **Detailed time logger**: Print timing logs every 20 steps by default.
+- **MoE memory monitoring**: Add MoE memory monitoring with log output.
+- **Fused Linear Cross Entropy**: Cherry-pick FLCE optimization from community Megatron; additionally provides a Generic (pure PyTorch) implementation that significantly reduces peak memory from output-layer logits tensors on non-Blackwell GPUs.
+
+---
+
+> [!NOTE]
+> Below is Megatron-LM's original README.
+
+
+
 Megatron-LM & Megatron Core
 ===========================
 

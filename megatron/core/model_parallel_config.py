@@ -1,7 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional
+from typing import Callable, ContextManager, Optional, List
 
 import torch
 
@@ -245,6 +246,7 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+
     ###################
     # Pipeline Parallel
     ###################
@@ -314,6 +316,10 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
+    
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
     # CPU Offloading
@@ -348,6 +354,15 @@ class ModelParallelConfig:
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
+
+    ###################
+    # loong-megatron Add
+    ###################
+    reduce_variable_seq_shape_p2p_comm: bool = False
+    """If True, reduce the shape communication when variable_seq_lengths is True."""
+
+    custom_pipeline_recompute_layers: Optional[List[int]] = None
+    """Custom recomputation layers for each stage"""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

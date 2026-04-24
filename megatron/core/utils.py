@@ -338,13 +338,6 @@ def is_te_min_version(version, check_equality=True):
     return get_te_version() > PkgVersion(version)
 
 
-def get_torch_version():
-    """Get torch version from __version__."""
-
-    global _torch_version
-    return _torch_version
-
-
 def is_torch_min_version(version, check_equality=True):
     """Check if minimum version of `torch` is installed."""
     if not HAVE_PACKAGING:

@@ -271,11 +271,30 @@ class TopKRouter(Router):
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
-        tokens_per_expert = routing_map.sum(dim=0)
+        
+        num_tokens = routing_map.shape[0]
+        if not self.config.enable_chunkpipe:
+            tokens_per_expert = routing_map.sum(dim=0)
+        else:
+            chunk_num = self.config.chunk_num_per_seq
+            num_tokens = num_tokens * chunk_num
+            microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
+            ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
+            tokens_per_expert = ftp_map.get(microbatch_key, None)
+            if tokens_per_expert is None:
+                tokens_per_expert = routing_map.reshape(num_tokens, -1).sum(dim=0)
+            else:
+                # Clone to prevent in-place all-reduce from corrupting the cached tensor.
+                tokens_per_expert = tokens_per_expert.clone()
+            # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
+            chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
+            if chunk_index == 0 and microbatch_key in ftp_map:
+                del ftp_map[microbatch_key]
+        
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
-        num_tokens = routing_map.shape[0]
+
         total_num_tokens = num_tokens * self.tp_cp_group.size()
 
         aux_loss = switch_load_balancing_loss_func(
@@ -306,10 +325,19 @@ class TopKRouter(Router):
         experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
         to the sum of aux loss for each sequence in the batch. And then we divide the aux
         loss by the batch size to get averaged aux loss.
+
+        When chunkpipe is enabled, sequences are split into chunks and each chunk is
+        forwarded independently. To compute the exact same loss as the non-chunked case,
+        we accumulate scores and tokens_per_expert across all chunks of a sequence, and
+        compute the loss only on the last chunk using the full-sequence statistics.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
+        if self.config.enable_chunkpipe and self.config.chunk_num_per_seq > 1:
+            return self._apply_seq_aux_loss_chunkpipe(
+                probs, scores_for_aux_loss, routing_map, seq_length, bsz, seq_aux_loss_coeff
+            )
 
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         tokens_per_expert = routing_map.reshape(seq_length, -1).sum(dim=0)
@@ -336,6 +364,112 @@ class TopKRouter(Router):
         )
         return probs
 
+
+    def _accumulate_chunkpipe_tokens_per_expert(
+        self, routing_map: torch.Tensor, seq_length: int, bsz: int
+    ):
+        """Accumulate tokens_per_expert across chunks during the original forward pass.
+
+        This runs under torch.no_grad() (inside CheckpointFunction.forward) so that
+        the full-sequence tokens_per_expert is available for each chunk's backward
+        recomputation to compute per-chunk partial aux_loss with correct gradients.
+
+        Values are stored per-microbatch to handle 1F1B pipeline interleaving where
+        multiple microbatches' forwards may complete before any backward starts.
+        """
+        chunk_num = self.config.chunk_num_per_seq
+        chunkpipe_fwd_mb = self.config.chunkpipe_forward_microbatch
+        chunk_index = chunkpipe_fwd_mb % chunk_num
+        microbatch_key = chunkpipe_fwd_mb // chunk_num
+
+        tokens_per_expert_chunk = routing_map.reshape(seq_length, -1).sum(dim=0)
+
+        if not hasattr(self, '_chunkpipe_full_tokens_per_expert_map'):
+            self._chunkpipe_full_tokens_per_expert_map = {}
+
+        if chunk_index == 0:
+            # First chunk in forward order: initialize for this microbatch
+            self._chunkpipe_full_tokens_per_expert_map[microbatch_key] = (
+                tokens_per_expert_chunk.detach().clone()
+            )
+        else:
+            self._chunkpipe_full_tokens_per_expert_map[microbatch_key].add_(
+                tokens_per_expert_chunk.detach()
+            )
+
+    def _apply_seq_aux_loss_chunkpipe(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+        seq_aux_loss_coeff: float,
+    ):
+        """Compute seq_aux_loss equivalent to the non-chunked case under chunkpipe.
+
+        The non-chunked loss for sample b is:
+            L_b = Σ_e (Σ_t P[b,t,e]) * (Σ_t F[b,t,e]) * E * coeff / (topk * S²)
+        where S is the full sequence length.
+
+        The loss can be decomposed into per-chunk contributions:
+            L = Σ_c L_c, where L_c = coeff * Σ_e (Σ_{t∈chunk_c} P[t,e]) * F_total[e] / ...
+
+        Each chunk computes its partial loss L_c using:
+            - Current chunk's scores (WITH gradient) for Σ_{t∈chunk_c} P[t,e]
+            - Full-sequence tokens_per_expert F_total (pre-accumulated during original
+              forward, detached) as the coefficient
+            - total_num_tokens = full_seq_length (S)
+        """
+        chunk_num = self.config.chunk_num_per_seq
+        scores_chunk = scores_for_aux_loss.reshape(seq_length, -1)
+
+        # Look up full-sequence tokens_per_expert pre-accumulated during original forward.
+        # During backward recomputation, use chunkpipe_backward_microbatch to find the
+        # correct microbatch's accumulated tokens_per_expert.
+        microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
+        ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
+        tokens_per_expert_chunk = ftp_map.get(microbatch_key, None)
+        # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
+        chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
+        if chunk_index == 0 and microbatch_key in ftp_map:
+            del ftp_map[microbatch_key]
+
+        if tokens_per_expert_chunk is None:
+            # Fallback: if accumulation didn't happen, use current chunk's tokens_per_expert
+            tokens_per_expert_chunk = routing_map.reshape(seq_length, -1).sum(dim=0)
+        else:
+            # Clone to prevent in-place all-reduce from corrupting the cached tensor,
+            # which is reused by subsequent backward chunks.
+            tokens_per_expert_chunk = tokens_per_expert_chunk.clone()
+        full_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            tokens_per_expert_chunk, self.tp_cp_group
+        ).detach()
+        # Use full-sequence parameters for correct scaling
+        full_seq_length = seq_length * chunk_num
+        total_num_tokens = full_seq_length * self.tp_cp_group.size()
+
+        # Compute this chunk's partial aux_loss contribution:
+        # L_c = coeff * Σ_e [ (Σ_{t∈chunk} scores[t,e]) * F_total[e] ] / (topk * T² * bsz)
+        aux_loss = (
+            switch_load_balancing_loss_func(
+                probs=scores_chunk,
+                tokens_per_expert=full_tokens_per_expert.detach(),
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=seq_aux_loss_coeff,
+                fused=self.config.moe_router_fusion,
+            )
+            / bsz
+        )
+
+        probs = self.attach_and_log_load_balancing_loss(
+            probs, seq_aux_loss_coeff, aux_loss, "seq_load_balancing_loss", self.tp_cp_group
+        )
+
+        return probs
+
     def _apply_global_aux_loss(
         self, probs: torch.Tensor, scores_for_aux_loss: torch.Tensor, routing_map: torch.Tensor
     ):
@@ -344,16 +478,34 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
-        tokens_per_expert = routing_map.sum(dim=0)
+        num_tokens = scores_for_aux_loss.shape[0]
+        if not self.config.enable_chunkpipe:
+            tokens_per_expert = routing_map.sum(dim=0)
+        else:
+            chunk_num = self.config.chunk_num_per_seq
+            num_tokens = num_tokens * chunk_num
+            microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
+            ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
+            tokens_per_expert = ftp_map.get(microbatch_key, None)
+            if tokens_per_expert is None:
+                tokens_per_expert = routing_map.reshape(num_tokens, -1).sum(dim=0)
+            else:
+                # Clone to prevent in-place all-reduce from corrupting the cached tensor.
+                tokens_per_expert = tokens_per_expert.clone()
+            # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
+            chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
+            if chunk_index == 0 and microbatch_key in ftp_map:
+                del ftp_map[microbatch_key]
+        
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_dp_cp_group
         )
-
-        self.global_tokens_per_expert += tokens_per_expert
-        self.ga_steps += 1
+        if not self.config.enable_chunkpipe \
+            or self.config.chunkpipe_backward_microbatch % chunk_num == self.config.chunk_num_per_seq - 1:
+            self.global_tokens_per_expert += tokens_per_expert
+            self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
-        num_tokens = scores_for_aux_loss.shape[0]
         total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
 
         global_aux_loss = switch_load_balancing_loss_func(
@@ -397,6 +549,13 @@ class TopKRouter(Router):
             num_layers,
             reduce_group=reduce_group,
         )
+
+        # Log the unscaled loss for correct metric tracking.
+        # The logging tracker uses loss_scale = 1/get_num_microbatches() (not chunk-inflated),
+        # so the unscaled per-chunk partial losses sum correctly across chunks and sequences.
+        if self.config.enable_chunkpipe:
+            aux_loss = aux_loss * self.config.chunk_num_per_seq
+
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
             # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
@@ -509,6 +668,18 @@ class TopKRouter(Router):
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
+
+        # Pre-accumulate tokens_per_expert during original forward (under no_grad)
+        # for chunkpipe seq_aux_loss. This runs before activation recomputation so that
+        # the full-sequence tokens_per_expert is available during each chunk's backward.
+        # Use routing_map from compute_routing_scores_for_aux_loss (without expert_bias
+        # and group_topk) to match what baseline _apply_seq_aux_loss uses.
+        if (self.training and not torch.is_grad_enabled()
+                and self.config.enable_chunkpipe and self.config.chunk_num_per_seq > 1):
+            routing_map_for_accum, _ = compute_routing_scores_for_aux_loss(
+                logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
+            )
+            self._accumulate_chunkpipe_tokens_per_expert(routing_map_for_accum, seq_length, bsz)
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():

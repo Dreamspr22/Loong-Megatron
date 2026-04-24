@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union, Any
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ from ..utils import (
     is_torch_min_version,
     scaled_init_method_normal,
 )
+from ..parallel_state import get_pipeline_model_parallel_rank
 
 try:
     from packaging.version import Version as PkgVersion
@@ -50,6 +51,18 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_loss_scaling_factor: Optional[float] = None
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
+
+    mtp_loss_scaling_factor_decay_ratio: Optional[float] = None
+    """Weighting factor decay ratio for Multi-Token Prediction (MTP) loss."""
+
+    mtp_shared_layers: bool = False
+    """Share (tie) all MTP layers. A single MTP layer is created and recurrently
+    forwarded multiple times instead of creating multiple independent layers."""
+
+    mtp_connection_type: str = 'sequential'
+    """Connection type of Multi-Token Prediction (MTP). 
+    'sequential': each MTP layer takes the previous MTP layer's hidden states as input (chain).
+    'parallel': every MTP layer takes the main model's hidden states as input (fan-out)."""
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
@@ -208,6 +221,28 @@ class TransformerConfig(ModelParallelConfig):
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+    
+    ####################
+    # attention variant
+    ####################
+    experimental_attention_variant: Optional[str] = None
+    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: bool = False
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
@@ -325,7 +360,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts",
+             "a2a_overlap_attn","a2a_overlap_post_attn", "a2a_overlap_mlp".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -336,8 +372,10 @@ class TransformerConfig(ModelParallelConfig):
     "shared_experts": recompute the shared experts in the MoE layer.
     "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "a2a_overlap_attn", "a2a_overlap_post_attn", "a2a_overlap_mlp": recompute computation segments
+    that are split to enable expert-parallel All-to-All communication overlap; only valid when EP
+    A2A overlap is enabled.
     """
-
     ####################
     # fp8 related
     ####################
@@ -401,6 +439,17 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers at the end of the model to keep in BF16 precision when
     first_last_layers_bf16 is True."""
 
+    selective_fp8: bool = False
+    """If True, enable selective FP8 training: only whitelisted modules
+    (determined by selective_fp8_allowed_ub_names) run in FP8, all other
+    modules (MLP, norms, etc.) stay in BF16.  Each component's config
+    (e.g. LLM foundation, ViT image encoder) can independently set this
+    flag via its own YAML."""
+
+    selective_fp8_allowed_ub_names: Optional[List[str]] = None
+    """Userbuffer names (TE linear layer names) that are allowed to run in FP8 during
+    selective FP8 training. Defaults to empty (no modules enabled) if not specified."""
+
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
@@ -419,6 +468,37 @@ class TransformerConfig(ModelParallelConfig):
     """If set, keep the parameters in fp4 precision to save memory. This option must be used
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
+
+    ####################
+    # chunkpipe related
+    ####################
+    enable_chunkpipe: bool = False
+    """when set to true, split sequence into multiple chunks"""
+
+    chunksize: int = 0
+    """size for each chunk"""
+
+    chunk_num_per_seq: int = 0
+    """number of chunks per sequence, calculated as seq_length // chunksize"""
+
+    keep_activations_chunks: int = 0
+    """num of chunks of which activations will be retained"""
+
+    chunkpipe_forward_microbatch: int = 0
+    """microbatch num for chunk pipe forward"""
+
+    chunkpipe_backward_microbatch: int = 0
+    """microbatch num for chunk pipe backward"""
+
+    chunk_keys: dict[int, Any] = None
+    """caches for keys"""
+
+    chunk_values: dict[int, Any] = None
+    """caches for values"""
+
+    chunkpipe_forward: bool = False
+    """chunkpipe forward"""
+
 
     ####################
     # MoE related
@@ -588,6 +668,19 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    ### moe memory monitor ###
+    enable_moe_mem_monitor: bool = False
+    """ Whether to enable memory monitor. """
+
+    print_moe_mem_monitor_interval: int = 1000
+    """ Interval to print memory monitor. """
+
+    moe_mem_monitor_log: str = None
+    """ Path to log memory monitor. """
+
+    moe_mem_monitor_force_print_token_threshold: int = 100000000
+    """ Threshold to force print memory monitor. """
+
     ##################
     # Context Parallel
     ##################
@@ -650,6 +743,57 @@ class TransformerConfig(ModelParallelConfig):
     TransformerLayer._forward_attention().
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    recompute_hyper_connections: bool = False
+    """Enable recomputation for HyperConnection intermediate activations.
+    
+    When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
+    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by MHCBlockRecomputeManager.
+    This significantly reduces memory usage by discarding intermediate activations and 
+    recomputing them during backward pass.
+    
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
+    
+    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
+    serves as the hook_tensor for registering the unified recompute hook."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new MHCBlockRecomputeManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block."""
+
+    mhc_use_perm_decomposition: bool = False
+    """Enable mHC perm decomposition. 
+    https://arxiv.org/abs/2601.05732"""
+
+    mhc_use_triton_fused_kernel: bool = False
+    """Enable mHC Triton fused kernel. 
+    https://github.com/WithNucleusAI/mHC-triton/tree/main"""
 
     ####################
     # miscellaneous
@@ -725,12 +869,55 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    # reduce variable seq shape p2p comm
+    p2p_comm_fixed_seq_lengths_per_rank: int = 0
+    """If enabled, all the lengths of p2p data will be padding to fixed lengths;
+    It can be uesed for sft, to reduce communication shape of  variable seq.
+    the fixed lengths is seq-length-per-rank + 1."""
+    micro_batch_size: int = 1
+    """The micro batch size to use for training."""
+
+    #####################################
+    # Fine-grained Activation Offloading
+    #####################################
+    fine_grained_activation_offloading: bool = False
+    """If True, offload the input of the specified modules to the CPU."""
+
+    offload_modules: Optional[list[str]] = None
+    """The submodules to offload its input.
+    choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
+    "attn_norm": offload the input of the normalization in the attention part.
+    "core_attn": offload the input of the core attention part.
+    "mlp_norm": offload the input of the normalization in the mlp part.
+    "attn_proj": offload the input of the attn linear projection part.
+    "expert_fc1": offload the input of the expert fc1 part.
+    "moe_act": offload the input of the moe act part.
+    """
+    offload_tensors: Optional[list[str]] = None
+    """Tensors to offload to CPU during forward pass and reload during backward pass.
+    Choices: "dispatched_input", "pre_mlp_layernorm_output".
+    "dispatched_input": This tensor is the output of pre_routed_experts_compute() and 
+    serves as the input to routed_experts_compute(). It contains the token data that 
+    has been routed and prepared to be sent to individual experts.
+    "pre_mlp_layernorm_output": This tensor is the output of pre_mlp_layernorm and 
+    serves as the input to shared_experts_compute().
+    """
+    min_offloaded_tensor_size: int = 1024 * 1024
+    """The minimum size of the tensor to be offloaded."""
+
+
+    use_fp32_dtype_for_param_pattern: Optional[List[str]] = None
+    """The module list for fp32 param training"""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self.chunk_keys = {}
+        self.chunk_values = {}
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
@@ -890,7 +1077,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"CPU offloading can be done only for layers less than {self.num_layers}"
             )
-
+        
         if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
             raise ValueError(
                 "Currently there is no support for Pipeline parallelism with CPU offloading"
@@ -919,7 +1106,8 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if self.recompute_granularity != "selective" and self.recompute_num_layers is None \
+                    and self.custom_pipeline_recompute_layers is None:
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -948,11 +1136,17 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
+                    "pre_mlp",
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "routed_experts",
+                    "a2a_overlap_attn",
+                    "a2a_overlap_post_attn",
+                    "a2a_overlap_mlp",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -987,6 +1181,18 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "shared_experts recompute cannot work with --moe-shared-expert-overlap."
                     )
+            if "a2a_overlap_attn" in self.recompute_modules and not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "a2a_overlap_attn recompute cannot work with --overlap-moe-expert-parallel-comm."
+                )
+            if "a2a_overlap_post_attn" in self.recompute_modules and not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "a2a_overlap_post_attn recompute cannot work with --overlap-moe-expert-parallel-comm."
+                )
+            if "a2a_overlap_mlp" in self.recompute_modules and not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "a2a_overlap_mlp recompute cannot work with --overlap-moe-expert-parallel-comm."
+                )
 
             if self.fp8:
                 if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
@@ -1014,6 +1220,94 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for recompute_hyper_connections
+        if self.recompute_hyper_connections:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "recompute_hyper_connections requires enable_hyper_connections=True."
+                )
+            if self.recompute_granularity != "selective":
+                raise ValueError(
+                    "recompute_hyper_connections requires recompute_granularity='selective'. "
+                    f"Got recompute_granularity={self.recompute_granularity}."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "recompute_hyper_connections cannot be used together with 'mlp' in "
+                    "recompute_modules. They use different checkpoint mechanisms that may conflict."
+                )
+
+        # Validation for hyper_connections with tensor parallelism
+        # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
+        # This is because HyperConnectionModule uses non-TP-aware layers (nn.Linear, nn.RMSNorm),
+        # and their gradients need to be synchronized across TP ranks via the sequence_parallel
+        # attribute mechanism.
+        if self.enable_hyper_connections and self.tensor_model_parallel_size > 1:
+            if not self.sequence_parallel:
+                raise ValueError(
+                    "When enable_hyper_connections=True and tensor_model_parallel_size > 1, "
+                    "sequence_parallel must be True. HyperConnectionModule parameters require "
+                    "gradient synchronization across TP ranks, which is handled by the "
+                    "sequence_parallel mechanism."
+                )
+
+        if self.fine_grained_activation_offloading:
+            # At least one of offload_modules or offload_tensors must be specified
+            has_modules = self.offload_modules is not None and len(self.offload_modules) > 0
+            has_tensors = self.offload_tensors is not None and len(self.offload_tensors) > 0
+            
+            assert has_modules or has_tensors, (
+                "fine_grained_activation_offloading requires at least one of "
+                "offload_modules or offload_tensors to be specified."
+            )
+            
+            # Validate offload_modules if specified
+            if has_modules:
+                allowed_modules = {
+                    "core_attn",
+                    "attn_proj",
+                    "expert_fc1",
+                    "moe_act",
+                    "attn_norm",
+                    "mlp_norm",
+                }
+                invalid_modules = set(self.offload_modules) - allowed_modules
+                assert not invalid_modules, (
+                    f'Invalid choices for offload_modules: {invalid_modules}. '
+                    f'Allowed modules are: {allowed_modules}'
+                )
+                if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
+                    raise ValueError(
+                        "attn_proj cannot be set to offload_modules alone without core_attn "
+                        "because the input of attn_proj is the output of core_attn, "
+                        "which is needed in core_attn.backward()."
+                    )
+            
+            # Validate offload_tensors if specified
+            if has_tensors:
+                allowed_tensors = {
+                    "dispatched_input",
+                    "pre_mlp_layernorm_output",
+                }
+                invalid_tensors = set(self.offload_tensors) - allowed_tensors
+                assert not invalid_tensors, (
+                    f'Invalid choices for offload_tensors: {invalid_tensors}. '
+                    f'Allowed tensors are: {allowed_tensors}'
+                )
+                if "dispatched_input" in self.offload_tensors and "a2a_overlap_mlp" not in self.recompute_modules:
+                    raise ValueError(
+                        "Offloading 'dispatched_input' is only supported when 'a2a_overlap_mlp' recomputation "
+                        "is enabled. Please add 'a2a_overlap_mlp' to --recompute-modules."
+                    )
+                if (
+                    "pre_mlp_layernorm_output" in self.offload_tensors
+                    and "a2a_overlap_mlp" not in self.recompute_modules
+                ):
+                    raise ValueError(
+                        "Offloading 'dispatched_input' is only supported when 'a2a_overlap_mlp' recomputation "
+                        "is enabled. Please add 'a2a_overlap_mlp' to --recompute-modules."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -1076,7 +1370,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
-            self.pipeline_model_parallel_layout.validate_layer_layout(
+            self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
 
@@ -1250,6 +1544,8 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                if self.enable_chunkpipe:
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):
@@ -1303,11 +1599,11 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
-            raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
-            )
+        #if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        #    raise ValueError(
+        #        "Expert bias for aux-loss-free routing only supports sigmoid score function."
+        #        "Please set --moe-router-score-function sigmoid for sigmoid score function."
+        #    )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
@@ -1540,7 +1836,23 @@ class TransformerConfig(ModelParallelConfig):
                     f"the number of layers ({self.num_layers})"
                 )
 
-
+        if self.use_fp32_dtype_for_param_pattern is not  None:
+            allowed_modules = {
+                "expert_bias",
+                "output_layer",
+                "final_layernorm",
+                "input_layernorm",
+                "pre_mlp_layernorm",
+                "router",
+                "self_attention_hyper_connection",
+                "mlp_hyper_connection"
+            }
+            invalid_modules = set(self.use_fp32_dtype_for_param_pattern) - allowed_modules
+            assert not invalid_modules, (
+                f"Invalid choices for recompute_modules: {invalid_modules}. "
+                f"Allowed modules are: {allowed_modules}"
+            )
+        
 @dataclass
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
@@ -1601,6 +1913,9 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+    
+    padding_v_to_qk_dim: bool = False
+    """Pad the value dimension to query and key dimension"""
 
     def __post_init__(self):
         super().__post_init__()

@@ -78,6 +78,7 @@ from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
+    ChunkDataIterator,
     RerunDataIterator,
     RerunMode,
 )
@@ -89,6 +90,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -850,6 +852,16 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def print_module_param_dtypes(module):
+    """Print parameter data types of a given PyTorch module."""
+    for name, param in module.named_parameters():
+        print_rank_0(f"param {name}: {param.data.dtype}")
+
+    if hasattr(module, "named_buffers"):
+        for name, buffer in module.named_buffers():
+            print_rank_0(f"buffer {name}: {buffer.dtype}")
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
@@ -920,11 +932,37 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
+    fp32_training_weights = None
     # Fp16 conversion.
     if args.fp16 or args.bf16:
+        param_pattern = args.use_fp32_dtype_for_param_pattern
+        if param_pattern and not isinstance(param_pattern, list):
+            param_pattern = [param_pattern]
+
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
+        
+        fp32_training_weights = param_pattern
+        #covert fp32
+        if fp32_training_weights:
+            for module in zip(model):
+                if not isinstance(module, list):
+                    module = module[0]
+                for name, buf in module.module.named_parameters():
+                    if any(fp32_weight in name for fp32_weight in fp32_training_weights):
+                        buf.data = buf.data.to(dtype=torch.float32)
+                        print(f'verl check update param precison {name}')
+
+                for name, buf in module.module.named_buffers():
+                    if any(fp32_weight in name for fp32_weight in fp32_training_weights):
+                        buf.data = buf.data.to(dtype=torch.float32)
+                        print(f'verl check update buffer precison {name}')
+
+        if param_pattern:
+            print_rank_0("> model param_dtypes:")
+            print_module_param_dtypes(model[0])
+        
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         #for model_module in model:
@@ -974,6 +1012,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
+
+            kwargs["force_turn_on_bucketing"] = args.force_turn_on_bucketing
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1566,6 +1606,16 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
     if iteration % args.log_interval == 0:
         if args.record_memory_history and is_last_rank():
             snapshot = torch.cuda.memory._snapshot()
@@ -1728,7 +1778,8 @@ def save_checkpoint_and_time(
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
-    energy_monitor.pause()
+    if args.log_energy and energy_monitor is not None:
+        energy_monitor.pause()
 
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
@@ -1770,7 +1821,8 @@ def save_checkpoint_and_time(
         )
 
     # Recover timing
-    energy_monitor.resume()
+    if args.log_energy and energy_monitor is not None:
+        energy_monitor.resume()
     timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -2551,12 +2603,19 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+
+            tmp_num_microbatches = eval_num_microbatches
+            tmp_seq_length = args.seq_length
+            if args.enable_chunkpipe:
+                num_chunks = args.seq_length // args.chunksize
+                tmp_num_microbatches *= num_chunks
+                tmp_seq_length = args.chunksize
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                num_microbatches=tmp_num_microbatches,
+                seq_length=tmp_seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
@@ -2771,19 +2830,24 @@ def get_train_valid_test_num_samples():
 
     return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
-
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
+def build_train_valid_test_datasets(
+    build_train_valid_test_datasets_provider,
+    train_valid_test_num_samples=None,
+    vp_stage=None,
+):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
-    print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    if vp_stage is not None:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples, vp_stage=vp_stage)
+    else:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -2807,12 +2871,18 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
+    if args.preprocess_data_on_cpu:
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
+
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
+            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None,
+            vp_stage=vp_stage,
         )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
         
@@ -2838,12 +2908,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
         do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device=device
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor([0, 0, 0], dtype=torch.long, device=device)
 
-    torch.distributed.broadcast(flags, 0)
+    if args.preprocess_data_on_cpu:
+        print("Dataset preprocessing does not require this step.")
+    else:
+        torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
@@ -2854,37 +2927,46 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider,
+        vp_stage=vp_stage
     )
 
     # Build iterators.
     dl_type = args.dataloader_type
     assert dl_type in ['single', 'cyclic', 'external']
 
-    def _get_iterator(dataloader_type, dataloader):
+    def _get_iterator(args, dataloader_type, dataloader):
         """Return dataset iterator."""
-        if dataloader_type == "single":
-            return RerunDataIterator(iter(dataloader))
-        elif dataloader_type == "cyclic":
-            return RerunDataIterator(iter(cyclic_iter(dataloader)))
-        elif dataloader_type == "external":
-            # External dataloader is passed through. User is expected to define how to iterate.
-            if isinstance(dataloader, list):
-                return [RerunDataIterator(d) for d in dataloader]
+        if args.enable_chunkpipe:
+            num_chunks = args.seq_length // args.chunksize
+            if dataloader_type == "single":
+                return ChunkDataIterator(num_chunks, iter(dataloader))
             else:
-                return RerunDataIterator(dataloader)
+                # TODO:only support "single" type, will support other type future
+                raise RuntimeError("unexpected dataloader type")
         else:
-            raise RuntimeError("unexpected dataloader type")
+            if dataloader_type == "single":
+                return RerunDataIterator(iter(dataloader))
+            elif dataloader_type == "cyclic":
+                return RerunDataIterator(iter(cyclic_iter(dataloader)))
+            elif dataloader_type == "external":
+                # External dataloader is passed through. User is expected to define how to iterate.
+                if isinstance(dataloader, list):
+                    return [RerunDataIterator(d) for d in dataloader]
+                else:
+                    return RerunDataIterator(dataloader)
+            else:
+                raise RuntimeError("unexpected dataloader type")
 
     if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        train_data_iterator = _get_iterator(args, dl_type, train_dataloader)
     else:
         train_data_iterator = None
 
@@ -2911,17 +2993,17 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
                 )
                 valid_data_iterators = [
-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                    _get_iterator(args, valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
-            valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
+            valid_data_iterators = _get_iterator(args, dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:
         valid_data_iterators = None
 
     if test_dataloader is not None:
-        test_data_iterator = _get_iterator(dl_type, test_dataloader)
+        test_data_iterator = _get_iterator(args, dl_type, test_dataloader)
     else:
         test_data_iterator = None
 

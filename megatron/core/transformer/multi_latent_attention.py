@@ -1,11 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-
 import math
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 try:
     from einops import rearrange
@@ -21,6 +21,11 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -87,12 +92,12 @@ class MultiLatentAttention(Attention):
     def __init__(
         self,
         config: MLATransformerConfig,
-        submodules: Union[MLASelfAttentionSubmodules],
+        submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: ProcessGroupCollection = None,       
     ) -> None:
 
         super().__init__(
@@ -147,6 +152,17 @@ class MultiLatentAttention(Attention):
                 f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
                 "'rope' and 'yarn'"
             )
+        
+        self.v_channels = self.config.v_head_dim
+        self.padding_v_head_dim = False
+
+        if self.config.padding_v_to_qk_dim and self.q_head_dim > self.config.v_head_dim:
+            self.v_channels = self.q_head_dim
+            self.padding_v_head_dim = True
+        
+        if self.config.enable_chunkpipe:
+            self.v_channels = self.q_head_dim
+            self.padding_v_head_dim = True
 
         self.core_attention = build_module(
             submodules.core_attention,
@@ -156,7 +172,7 @@ class MultiLatentAttention(Attention):
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
             k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
+            v_channels=self.v_channels,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
@@ -187,6 +203,259 @@ class MultiLatentAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+        # Initialize chunkpipe KV cache configuration
+        if self.config.enable_chunkpipe:
+            self.setup_chunkpipe_kv_cache_config()
+
+    def init_chunk_key_value_cache_mla(self):
+        """Initialize the chunk-based key-value cache for chunkpipe functionality in MLA."""
+
+        # Initialize cache tensors with proper device and dtype
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        
+        total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
+        kv_cache_shape = (total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(), 
+                          self.config.micro_batch_size, self.config.kv_lora_rank)
+        k_pos_emb_cache_shape = (total_cache_tokens, self.config.micro_batch_size,
+                                 self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+        
+        self.kv_compressed_cache = torch.zeros(kv_cache_shape, device=device, dtype=dtype)
+        self.key_pos_emb_cache = torch.zeros(k_pos_emb_cache_shape, device=device, dtype=dtype)
+
+        self.kv_compressed_cache_grad = {}
+        self.key_pos_emb_cache_grad = {}
+
+    def append_chunk_key_value_cache_mla(self, normed_kv_compressed, k_pos_emb):
+        """Cache a chunk of compressed key-value pairs and positional embeddings for MLA.
+        
+        Args:
+            normed_kv_compressed (Tensor): Normalized compressed key-value tensor 
+                with shape [chunksize, batch_size, kv_lora_rank]
+            k_pos_emb (Tensor): Key positional embeddings with shape 
+                [chunksize, batch_size, 1, qk_pos_emb_head_dim]
+        
+        Raises:
+            RuntimeError: If chunkpipe is not enabled in config
+            RuntimeError: If no available cache chunks
+        """
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError("Chunk key-value cache operations require chunkpipe to be enabled.")    
+        
+        # Skip caching during backward pass or for last chunk in sequence
+        if not self.config.chunkpipe_forward or \
+           (self.config.chunkpipe_forward_microbatch + 1) % self.num_chunks_per_seq == 0:
+            return
+        
+        if not self.empty_chunk_indices:
+            raise RuntimeError("No available cache chunks. Consider increasing cache size.")
+            
+        chunk_id = self.empty_chunk_indices.pop(0)
+        self.micro_batch_to_cache_chunk_map[self.config.chunkpipe_forward_microbatch] = chunk_id
+        
+        # Store compressed KV and positional embeddings
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        kv_cache_indices = torch.arange(self.config.chunksize // tp_size) + \
+            (chunk_id * self.config.chunksize // tp_size)
+        pos_cache_indices = torch.arange(self.config.chunksize) + (chunk_id * self.config.chunksize)
+        
+        # When the 3rd dim of k_pos_emb is smaller than the cache, 
+        # only write to the first corresponding indices
+        k_pos_emb_head_num = k_pos_emb.size(2)
+        if self.is_enable_grad_chunkpipe():
+            # detach kv compressed tensors that enter the KV cache to prevent gradient tracking
+            # of the same computational graph twice, which will result in runtime exception 
+            self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed.clone().detach()
+            self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb.clone().detach()
+        else:
+            self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed
+            self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb
+
+    def recover_key_value_up_proj_tensors(self, normed_kv_compressed, k_pos_emb):
+        """Recover full key and value tensors from compressed representations.
+        
+        This function performs the up-projection operation to recover full key and 
+        value tensors from their compressed latent representations. This is needed
+        for chunkpipe when reconstructing cached chunks.
+        
+        Args:
+            normed_kv_compressed (Tensor): Normalized compressed KV tensor with shape 
+                [seq_len / TP, batch_size, kv_lora_rank]
+            k_pos_emb (Tensor): Key positional embeddings with shape 
+                [seq_len, batch_size, 1, qk_pos_emb_head_dim]
+        
+        Returns:
+            tuple:
+                recovered_key: Full key tensor with shape 
+                    [seq_len, batch_size, num_heads, q_head_dim]
+                recovered_value: Full value tensor with shape 
+                    [seq_len, batch_size, num_heads, v_head_dim]
+        """
+        # Project compressed KV through up-projection
+        kv, _ = self.linear_kv_up_proj(normed_kv_compressed)
+
+        # Reshape and split into key and value components
+        kv = kv.view(
+            *kv.size()[:-1],
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.v_head_dim,
+        )
+
+        k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
+
+        # Combine with positional embeddings (k_pos_emb is already [seq, batch, heads, dim])
+        key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+
+        # Pad value dimension if needed for flash attention compatibility
+        if self.padding_v_head_dim:
+            value = F.pad(value, [0, self.q_head_dim - self.config.v_head_dim])
+
+        key = key.contiguous()
+        value = value.contiguous()
+
+        return key, value
+
+    def concat_cached_chunk_key_value_mla(self, attention_mask, curr_key, curr_value):
+        """Concatenate all cached key-value chunks for the current sequence in MLA.
+        
+        This function is used during chunkpipe processing to combine cached key-value pairs
+        from previous chunks with the current chunk's keys and values. This enables the
+        attention mechanism to see the full sequence context across chunk boundaries.
+        
+        Args:
+            attention_mask (Tensor): Attention mask tensor for the current chunk
+            curr_key (Tensor): Current chunk's key tensor with shape 
+                [chunksize, batch_size, num_heads, head_dim]
+            curr_value (Tensor): Current chunk's value tensor with shape
+                [chunksize, batch_size, num_heads, head_dim]
+        
+        Returns:
+            tuple: (concatenated_key, concatenated_value, adjusted_mask)
+                concatenated_key: Concatenated key tensor with shape 
+                    [concatenated_tokens, batch_size, num_heads, head_dim] where 
+                    concatenated_tokens = (current_chunk_index + 1) * chunksize
+                concatenated_value: Concatenated value tensor with same shape as key
+                adjusted_mask: Adjusted attention mask with upper triangular masking
+                    to prevent attending to future tokens in autoregressive scenarios
+        
+        Raises:
+            RuntimeError: If chunkpipe is not enabled in config
+        """
+        # Check if chunkpipe functionality is enabled
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError("Chunk concatenation requires chunkpipe to be enabled.")
+        
+        # Determine current processing stage (forward or backward pass) and position
+        is_forward = self.config.chunkpipe_forward
+        microbatch_idx = (self.config.chunkpipe_forward_microbatch if is_forward 
+                         else self.config.chunkpipe_backward_microbatch)
+        current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
+        start_microbatch_idx = microbatch_idx - current_chunk_idx
+
+        # Initialize lists to store retrieved cache data
+        cached_kv_compressed = []
+        cached_key_pos_emb = []
+
+        # Calculate total sequence length after concatenation
+        total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
+        concatenated_key_shape = (total_concatenated_tokens, self.config.micro_batch_size, 
+                      self.num_attention_heads_per_partition, self.key_hidden_size)
+        concatenated_value_shape = (total_concatenated_tokens, self.config.micro_batch_size, 
+                      self.num_attention_heads_per_partition, self.config.v_head_dim)
+        if self.padding_v_head_dim:
+            concatenated_value_shape = (total_concatenated_tokens, self.config.micro_batch_size, 
+                      self.num_attention_heads_per_partition, self.key_hidden_size)
+        
+        # Initialize zero tensors for concatenated key and value of previous and current chunk
+        concatenated_key = torch.zeros(concatenated_key_shape,
+            device=self.kv_compressed_cache.device, dtype=self.kv_compressed_cache.dtype)
+        concatenated_value = torch.zeros(concatenated_value_shape,
+            device=self.kv_compressed_cache.device, dtype=self.kv_compressed_cache.dtype)
+
+        def kv_compressed_hook_fn(chunk_index):
+            """
+            Hook function to accumulate gradient of loss of current chunk 
+            with respect to cached compressed KV of previous chunk during backward pass.
+            """
+            def hook_fn(grad):
+                if chunk_index not in self.kv_compressed_cache_grad:
+                    self.kv_compressed_cache_grad[chunk_index] = grad
+                else:
+                    self.kv_compressed_cache_grad[chunk_index] += grad
+                return grad           
+            return hook_fn
+
+        def key_pos_emb_hook_fn(chunk_index):
+            """
+            Hook function to accumulate gradient of loss of current chunk
+            with respect to cached key position embeddings of previous chunks during backward pass.
+            """
+            def hook_fn(grad):
+                if chunk_index not in self.key_pos_emb_cache_grad:
+                    self.key_pos_emb_cache_grad[chunk_index] = grad
+                else:
+                    self.key_pos_emb_cache_grad[chunk_index] += grad
+                return grad           
+            return hook_fn
+        
+        # Retrieve all previous chunks from cache and concatenate with current chunk
+        current_pos = 0
+        for prev_chunk_idx in range(current_chunk_idx):
+            # Get the cache index for this previous chunk
+            cache_chunk_idx = self.micro_batch_to_cache_chunk_map[start_microbatch_idx + prev_chunk_idx]
+            
+            # Calculate tensor parallel indices for retrieving cached data
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            kv_indices = torch.arange(self.config.chunksize // tp_size) + \
+                (cache_chunk_idx * self.config.chunksize // tp_size)
+            pos_indices = torch.arange(self.config.chunksize) + (cache_chunk_idx * self.config.chunksize)
+
+            # Retrieve compressed KV and positional embeddings from cache
+            cached_kv_compressed.append(self.kv_compressed_cache[kv_indices, :, :])
+            cached_key_pos_emb.append(self.key_pos_emb_cache[pos_indices, :, :, :])
+
+            # Set up gradient hooks for backward pass
+            if self.is_enable_grad_chunkpipe():
+                cached_kv_compressed[-1].requires_grad = True
+                cached_key_pos_emb[-1].requires_grad = True
+                cached_kv_compressed[-1].register_hook(kv_compressed_hook_fn(prev_chunk_idx))
+                cached_key_pos_emb[-1].register_hook(key_pos_emb_hook_fn(prev_chunk_idx))
+            
+            # Recover full key and value tensors from compressed representations
+            cached_key, cached_value = self.recover_key_value_up_proj_tensors(
+                cached_kv_compressed[-1],
+                cached_key_pos_emb[-1]
+            )
+
+            # Concatenate along sequence dimension
+            concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+                cached_key
+            concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+                cached_value
+            current_pos += self.config.chunksize
+
+        # Add the current chunk's keys and values to the concatenated result
+        concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+            curr_key
+        concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+            curr_value  
+        
+        # Adjust attention mask for autoregressive (causal) attention
+        adjusted_mask = None        
+        if attention_mask is not None:
+            chunksize = self.config.chunksize
+            # Create a mask that prevents attending to future tokens
+            mask_org = torch.ones(chunksize, total_concatenated_tokens, dtype=torch.bool,
+                device=self.kv_compressed_cache.device)
+            mask_index = current_chunk_idx * chunksize + 1
+            # Apply upper triangular masking (applying in-place operation triu_ to avoid doubling memory)
+            mask_org.triu_(diagonal=mask_index)  
+            # Reshape mask to match attention mechanism requirements
+            # Using .view creates a new tensor without allocating additional memory
+            adjusted_mask = mask_org.view(1, 1, chunksize, total_concatenated_tokens) 
+            
+        return concatenated_key, concatenated_value, adjusted_mask
 
     def forward(
         self,
@@ -233,7 +502,7 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
+        query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
             position_ids,
@@ -248,6 +517,11 @@ class MultiLatentAttention(Attention):
         query, key, value, _, attn_mask_type, block_table = self._adjust_key_value_for_inference(
             inference_context, query, key, value, rotary_pos_emb=None
         )
+
+        # cache key, value for chunkpipe
+        if self.config.enable_chunkpipe:
+            # need to concat all chunk keys & values belong to the same sequence
+            key, value, attention_mask = self.concat_cached_chunk_key_value_mla(attention_mask, key, value)
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
@@ -266,15 +540,27 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
+            if self.offload_core_attention and self.training:
+                query = fine_grained_offloading_group_start(query, name="core_attn")
+
             if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=attn_mask_type,
-                )
+                extra_kwargs = {}
+                if self.config.experimental_attention_variant == "dsa":
+                    # For dsa we need to pass in the original hidden states and the compressed
+                    # query representation.
+                    extra_kwargs["x"] = hidden_states
+                    extra_kwargs["qr"] = q_compressed
+                with get_fine_grained_offloading_context(self.offload_core_attention):
+                    # core_attn_out: [..., h, kv_low_rank]
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                        **extra_kwargs,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -295,7 +581,10 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-
+            if self.offload_core_attention and self.training:
+                (core_attn_out,) = fine_grained_offloading_group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
             # core_attn_out = self.self.up_v_layer(core_attn_out)
@@ -304,6 +593,12 @@ class MultiLatentAttention(Attention):
 
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
+
+        # add for fa padding
+        if self.padding_v_head_dim:
+            _prefix = core_attn_out.shape[:-1]
+            core_attn_out = core_attn_out.reshape(*_prefix, -1, self.v_channels)
+            core_attn_out = core_attn_out[..., : self.config.v_head_dim].reshape(*_prefix, -1)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -320,7 +615,14 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
+        with get_fine_grained_offloading_context(self.offload_attn_proj):
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = fine_grained_offloading_group_commit(
+                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
 
         return output, bias
 
@@ -460,6 +762,10 @@ class MLASelfAttention(MultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
+        # Initialize chunkpipe MLA KV cache
+        if self.config.enable_chunkpipe:
+            self.init_chunk_key_value_cache_mla()
+
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -488,13 +794,21 @@ class MLASelfAttention(MultiLatentAttention):
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
 
+        # Calculate position embedding offset for chunkpipe
+        pos_emb_offset = 0
+        if self.config.enable_chunkpipe:
+            ck_fwd_mic = self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
+            if not self.config.chunkpipe_forward:
+                ck_fwd_mic = self.config.chunkpipe_backward_microbatch % self.config.chunk_num_per_seq
+            pos_emb_offset = ck_fwd_mic * self.config.chunksize
+
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, offset=pos_emb_offset, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
@@ -507,7 +821,8 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                rotary_pos_emb, mscale = \
+                    self.rotary_pos_emb(rotary_seq_len, offset=pos_emb_offset, packed_seq=packed_seq)
 
         if packed_seq_params is not None:
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -522,7 +837,7 @@ class MLASelfAttention(MultiLatentAttention):
             cu_seqlens_q = cu_seqlens_kv = None
 
         # =========================================
-        # QKV down projection and layernorm
+        # QKV down projection
         # =========================================
         if self.config.q_lora_rank is not None:
             # if linear_q_down_proj is ColumnParallelLinear:
@@ -579,6 +894,16 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = k_pos_emb.squeeze(1)
 
         # =========================================
+        # Apply norm
+        # =========================================
+
+        if self.config.q_lora_rank is not None:
+            # q_compressed: [num_tokens, q_lora_rank]
+            q_compressed = self.q_layernorm(q_compressed)
+
+        kv_compressed = self.kv_layernorm(kv_compressed)
+
+        # =========================================
         # QKV up projection and RoPE apply
         # =========================================
 
@@ -588,7 +913,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -597,8 +921,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
@@ -663,7 +985,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -672,8 +993,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
@@ -774,6 +1093,39 @@ class MLASelfAttention(MultiLatentAttention):
                     k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
                 key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
+            if self.config.enable_chunkpipe:
+                def kv_compressed_hook_fn(grad):
+                    """
+                    Hook function to combine compressed KV gradients of loss of subsequent chunk
+                    with respect to that of current chunk.
+                    """
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                        return grad
+                    else:
+                        grad_from_prev_chunk = self.kv_compressed_cache_grad.pop(chunks_in_current_sequence)
+                        return grad + grad_from_prev_chunk
+                
+                def key_pos_emb_hook_fn(grad):
+                    """
+                    Hook function to combine gradient of loss of current chunk
+                    with respect to key position embeddings of previous chunks.
+                    """
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                        return grad
+                    else:
+                        grad_from_prev_chunk = self.key_pos_emb_cache_grad.pop(chunks_in_current_sequence)
+                        return grad + grad_from_prev_chunk
+             
+                if self.is_enable_grad_chunkpipe():
+                    kv_compressed.register_hook(kv_compressed_hook_fn)
+                    k_pos_emb.register_hook(key_pos_emb_hook_fn)
+                self.append_chunk_key_value_cache_mla(kv_compressed, k_pos_emb)
+
+            if self.padding_v_head_dim:
+                value = F.pad(value, [0, self.q_head_dim - self.config.v_head_dim])
+
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
@@ -798,7 +1150,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        return query, key, value
+        return query, key, value, q_compressed, kv_compressed
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

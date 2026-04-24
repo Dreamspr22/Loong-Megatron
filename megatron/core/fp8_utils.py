@@ -2,10 +2,12 @@
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
+import warnings
 import weakref
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import wraps
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, Set
 
 import torch
 
@@ -57,9 +59,12 @@ except (ImportError, ModuleNotFoundError):
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
         TEColumnParallelLinear,
+        TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TELinear,
+        TERowParallelGroupedLinear,
         TERowParallelLinear,
     )
 
@@ -68,7 +73,10 @@ if HAVE_TE:
         TEColumnParallelLinear,
         TERowParallelLinear,
         TELayerNormColumnParallelLinear,
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
     )
+
 else:
     TE_LINEAR_TYPES = ()
 
@@ -77,6 +85,258 @@ try:
 except ImportError:
     Fp8Padding = None
     Fp8Unpadding = None
+
+
+_SELECTIVE_FP8_DEFAULT_ALLOWED_UB_NAMES = frozenset()
+Fp8InitDecisionFn = Callable[..., bool]
+_selective_fp8_init_decision_fn: Optional[Fp8InitDecisionFn] = None
+
+
+def register_selective_fp8_init_decision(fn: Fp8InitDecisionFn) -> None:
+    """Register a callback that decides per-module FP8 usage at init time.
+
+    Args:
+        fn: ``fn(config, *, te_cls, ub_name, init_kwargs) -> bool``.
+            Return True to keep FP8 for the module, False to disable.
+    """
+    global _selective_fp8_init_decision_fn
+    _selective_fp8_init_decision_fn = fn
+
+
+@dataclass
+class _SelectiveFp8StateEntry:
+    """Per-context selective FP8 state stored in a module-level stack."""
+
+    is_init: bool
+    fp8_recipe: Optional[Any] = None
+    fp8_group: Optional[Any] = None
+    allowed_ub_names: Optional[Set[str]] = None
+
+
+_SELECTIVE_FP8_STACK: List[_SelectiveFp8StateEntry] = []
+
+
+def _get_selective_fp8_stack() -> List[_SelectiveFp8StateEntry]:
+    return _SELECTIVE_FP8_STACK
+
+
+def _get_current_selective_fp8_state() -> Optional[_SelectiveFp8StateEntry]:
+    """Return the top of the selective FP8 state stack, or None if empty."""
+    stack = _get_selective_fp8_stack()
+    return stack[-1] if stack else None
+
+
+def _is_selective_fp8_config(config: TransformerConfig) -> bool:
+    return getattr(config, "selective_fp8", False)
+
+
+def _get_allowed_ub_names_from_config(config: TransformerConfig) -> Set[str]:
+    """Extract the set of allowed UB names from config, falling back to defaults."""
+    ub_names = getattr(config, "selective_fp8_allowed_ub_names", None)
+    return set(ub_names) if ub_names is not None else _SELECTIVE_FP8_DEFAULT_ALLOWED_UB_NAMES
+
+
+def _push_selective_fp8_state(
+    is_init: bool, fp8_recipe=None, fp8_group=None, allowed_ub_names=None,
+) -> None:
+    _get_selective_fp8_stack().append(
+        _SelectiveFp8StateEntry(
+            is_init=is_init,
+            fp8_recipe=fp8_recipe,
+            fp8_group=fp8_group,
+            allowed_ub_names=allowed_ub_names,
+        )
+    )
+
+
+def _pop_selective_fp8_state() -> None:
+    stack = _get_selective_fp8_stack()
+    if stack:
+        stack.pop()
+
+
+def _selective_fp8_active() -> bool:
+    return _get_current_selective_fp8_state() is not None
+
+
+def _selective_fp8_is_init() -> bool:
+    entry = _get_current_selective_fp8_state()
+    return entry is not None and entry.is_init
+
+
+def _selective_fp8_get_allowed_ub_names() -> Set[str]:
+    """Return the set of allowed UB names stored by the enclosing _SelectiveFp8Context."""
+    entry = _get_current_selective_fp8_state()
+    if entry and entry.allowed_ub_names is not None:
+        return entry.allowed_ub_names
+    return set(_SELECTIVE_FP8_DEFAULT_ALLOWED_UB_NAMES)
+
+
+if HAVE_TE:
+    # Use the non-deprecated autocast API to avoid DeprecationWarning overhead
+    # from transformer_engine.pytorch.fp8_autocast on every call.
+    try:
+        from transformer_engine.pytorch.quantization import autocast as _te_autocast
+    except ImportError:
+        _te_autocast = transformer_engine.pytorch.fp8_autocast
+
+    def _disable_fp8_context(is_init: bool):
+        if is_init:
+            return transformer_engine.pytorch.fp8_model_init(enabled=False)
+        return _te_autocast(enabled=False)
+
+
+    def _keep_fp8_for_ub_name(ub_name: Optional[str]) -> bool:
+        return ub_name in _selective_fp8_get_allowed_ub_names()
+
+
+    def _wrap_forward_with_selective_fp8_guard(cls) -> None:
+        """Wrap forward to selectively enter fp8_autocast per module.
+
+        The outer context intentionally does NOT enable fp8_autocast, so all
+        modules default to BF16. This wrapper re-enables FP8 only for modules
+        that were marked as FP8-eligible at init time
+        (``_selective_fp8_disabled=False``).
+
+        Fast path: modules with ``_selective_fp8_disabled=True`` (the majority)
+        skip with a single ``getattr`` — no thread-local stack access needed.
+        """
+        if getattr(cls, "_selective_fp8_forward_wrapped", False):
+            return
+        original_forward = cls.forward
+
+        @wraps(original_forward)
+        def wrapped_forward(self, *args, **kwargs):
+            # Fast path: init-time decision already marked this module as BF16.
+            if getattr(self, "_selective_fp8_disabled", True):
+                return original_forward(self, *args, **kwargs)
+            # Only access the thread-local stack for FP8-eligible modules.
+            state = _get_current_selective_fp8_state()
+            if state is None or state.is_init or state.fp8_recipe is None:
+                return original_forward(self, *args, **kwargs)
+            with _te_autocast(
+                enabled=True, recipe=state.fp8_recipe,
+                amax_reduction_group=state.fp8_group,
+            ):
+                return original_forward(self, *args, **kwargs)
+
+        cls.forward = wrapped_forward
+        cls._selective_fp8_forward_wrapped = True
+
+
+    def _should_disable_fp8_at_init(config, te_cls, ub_name, init_kwargs) -> bool:
+        """Determine if FP8 should be disabled for this module at init time."""
+        entry = _get_current_selective_fp8_state()
+        if entry is None or not entry.is_init:
+            return False
+        # Use the registered decision callback if available.
+        if _selective_fp8_init_decision_fn is not None:
+            return not _selective_fp8_init_decision_fn(
+                config, te_cls=te_cls, ub_name=ub_name, init_kwargs=init_kwargs)
+        # Otherwise fall back to the static whitelist.
+        return not _keep_fp8_for_ub_name(ub_name)
+
+
+    def _wrap_init_with_selective_fp8_guard(
+        cls, ub_name_arg: str = "tp_comm_buffer_name",
+    ) -> None:
+        if getattr(cls, "_selective_fp8_init_wrapped", False):
+            return
+        original_init = cls.__init__
+
+        @wraps(original_init)
+        def wrapped_init(self, *args, **kwargs):
+            ub_name = kwargs.get(ub_name_arg)
+            config = kwargs.get("config")
+            should_disable = _should_disable_fp8_at_init(config, cls, ub_name, kwargs)
+
+            ctx = _disable_fp8_context(is_init=True) if should_disable else nullcontext()
+            with ctx:
+                original_init(self, *args, **kwargs)
+
+            # Persist init-time decision for runtime fast path.
+            self._selective_fp8_disabled = should_disable
+
+        cls.__init__ = wrapped_init
+        cls._selective_fp8_init_wrapped = True
+
+
+    def _install_selective_fp8_guards() -> None:
+        linear_classes = (
+            TELayerNormColumnParallelLinear,
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+            TEColumnParallelGroupedLinear,
+            TERowParallelGroupedLinear,
+            TELinear,  # MLA down-projection (parallel_mode='duplicated')
+        )
+        for linear_cls in linear_classes:
+            _wrap_init_with_selective_fp8_guard(linear_cls)
+            _wrap_forward_with_selective_fp8_guard(linear_cls)
+        # TEDotProductAttention: only init guard needed.
+        # At runtime the outer context no longer enables FP8, so attention
+        # naturally runs in BF16 without a per-call disable wrapper.
+        _wrap_init_with_selective_fp8_guard(TEDotProductAttention, ub_name_arg="__unused__")
+
+        # Coverage check: ensure every TE_LINEAR_TYPES class is guarded.
+        _unguarded = set(TE_LINEAR_TYPES) - set(linear_classes)
+        if _unguarded:
+            _unguarded_names = sorted(c.__name__ for c in _unguarded)
+            warnings.warn(
+                f"selective_fp8: the following TE linear classes are in "
+                f"TE_LINEAR_TYPES but NOT covered by init/forward guards: "
+                f"{_unguarded_names}.  This will cause 'quantized weights "
+                f"without quantized compute' warnings and incorrect FP8 param "
+                f"handling for these modules.  Please add them to "
+                f"_install_selective_fp8_guards().",
+                UserWarning,
+                stacklevel=2,
+            )
+
+
+    _SELECTIVE_FP8_GUARDS_INSTALLED = False
+
+    def _ensure_selective_fp8_guards() -> None:
+        """Install selective FP8 guards lazily on first use.
+
+        This avoids monkey-patching TE classes at import time, eliminating
+        the per-forward function-call overhead when selective_fp8 is not used.
+        """
+        global _SELECTIVE_FP8_GUARDS_INSTALLED
+        if not _SELECTIVE_FP8_GUARDS_INSTALLED:
+            _install_selective_fp8_guards()
+            _SELECTIVE_FP8_GUARDS_INSTALLED = True
+
+
+    def validate_selective_fp8_coverage(model: torch.nn.Module) -> None:
+        """Validate that all TE linear modules have selective FP8 attributes set.
+
+        Call this after model construction (when selective_fp8 is enabled) to
+        detect TE modules that were created outside the selective FP8 init
+        guard, which would result in FP8-weight + BF16-compute mismatches.
+
+        Emits a warning for each unguarded module; raises if any are found.
+        """
+        unguarded = []
+        for name, module in model.named_modules():
+            if isinstance(module, TE_LINEAR_TYPES) and not hasattr(
+                module, "_selective_fp8_disabled"
+            ):
+                unguarded.append((name, type(module).__name__))
+
+        if unguarded:
+            details = "\n".join(
+                f"  - {name} ({cls_name})" for name, cls_name in unguarded
+            )
+            msg = (
+                f"selective_fp8: {len(unguarded)} TE module(s) lack the "
+                f"_selective_fp8_disabled attribute, meaning they were created "
+                f"without the selective FP8 init guard.  This causes FP8 "
+                f"weights + BF16 compute (the 'quantized weights without "
+                f"quantized compute' TE warning).  Unguarded modules:\n{details}\n"
+                f"Fix: add the missing TE class to _install_selective_fp8_guards()."
+            )
+            raise RuntimeError(msg)
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -419,15 +679,65 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
     is_first_layer = layer_no < num_bf16_layers_at_start
     is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
 
-    if layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer):
-        return True
-    else:
-        return False
+    return layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer)
 
 
 if HAVE_TE:
+    import inspect as _inspect
+
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
+
+    # Cache inspect.signature results to avoid repeated reflection.
+    _fp8_model_init_params = _inspect.signature(
+        transformer_engine.pytorch.fp8_model_init
+    ).parameters
+    _fp8_model_init_has_recipe = "recipe" in _fp8_model_init_params
+    _fp8_model_init_has_preserve = "preserve_high_precision_init_val" in _fp8_model_init_params
+    del _fp8_model_init_params
+
+    class _SelectiveFp8Context:
+        """Context manager for selective FP8.
+
+        For init (is_init=True): enters the base fp8_model_init context so TE creates
+        FP8 params for whitelisted modules (qkv, proj).  Non-whitelisted modules get
+        disabled by the per-module init guard.
+
+        For runtime (is_init=False): does NOT enter fp8_autocast at the outer level.
+        Instead, stores fp8_recipe/fp8_group so that the per-module forward guard can
+        create individual fp8_autocast(enabled=True) contexts only for whitelisted
+        modules.  This reduces context switches from 6 disables → 2 enables per layer.
+        """
+
+        def __init__(self, base_context, is_init: bool,
+                     fp8_recipe=None, fp8_group=None, allowed_ub_names=None):
+            self.base_context = base_context
+            self.is_init = is_init
+            self.fp8_recipe = fp8_recipe
+            self.fp8_group = fp8_group
+            self.allowed_ub_names = allowed_ub_names
+
+        def __enter__(self):
+            _ensure_selective_fp8_guards()
+            _push_selective_fp8_state(
+                self.is_init, self.fp8_recipe, self.fp8_group, self.allowed_ub_names,
+            )
+            if self.is_init:
+                # Init phase: enter base fp8_model_init context as before
+                try:
+                    return self.base_context.__enter__()
+                except Exception:
+                    _pop_selective_fp8_state()
+                    raise
+            # Runtime: don't enter fp8_autocast; whitelisted modules enter individually
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                if self.is_init:
+                    return self.base_context.__exit__(exc_type, exc_val, exc_tb)
+            finally:
+                _pop_selective_fp8_state()
 
     def get_fp8_recipe(config: TransformerConfig):
         """Return fp8 recipe.
@@ -505,45 +815,59 @@ if HAVE_TE:
         need_fp8_context = config.fp8 if not is_init else config.fp8_param
 
         if not need_fp8_context or is_first_last_bf16_layer(config, layer_no):
-            # bf16 training or bf16 layer in fp8 training
+            # BF16 path: no outer FP8 context is needed.
+            # For selective-FP8 init, still enter a selective state scope so
+            # per-module init guards can run and persist runtime markers.
             fp8_context = nullcontext()
-        else:
-            # fp8 training and this layer_no is in fp8
-            fp8_recipe = get_fp8_recipe(config)
-
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
+            if _is_selective_fp8_config(config) and is_init:
+                allowed_ub_names = _get_allowed_ub_names_from_config(config)
+                return _SelectiveFp8Context(
+                    fp8_context, is_init=True, allowed_ub_names=allowed_ub_names
                 )
+            return fp8_context
 
-            if not is_init:
-                fp8_context = transformer_engine.pytorch.fp8_autocast(
+        fp8_recipe = get_fp8_recipe(config)
+
+        # First / last layer in bf16 isn't supported with delayed scaling since it
+        # requires entering/exiting fp8 context per layer, causing incorrect amax
+        # reduction behavior.
+        assert not (
+            config.first_last_layers_bf16 and isinstance(fp8_recipe, TEDelayedScaling)
+        ), "Delayed scaling does not support first / last layer in BF16."
+
+        fp8_group = None
+        if parallel_state.model_parallel_is_initialized():
+            fp8_group = parallel_state.get_amax_reduction_group(
+                with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
+            )
+
+        # Selective FP8 runtime: don't create the outer fp8_autocast context.
+        # Whitelisted modules (qkv, proj) will enter fp8_autocast individually,
+        # avoiding N disable context switches per layer (6 → 2 enable switches).
+        if _is_selective_fp8_config(config) and not is_init:
+            allowed_ub_names = _get_allowed_ub_names_from_config(config)
+            return _SelectiveFp8Context(
+                nullcontext(), is_init=False,
+                fp8_recipe=fp8_recipe, fp8_group=fp8_group,
+                allowed_ub_names=allowed_ub_names,
+            )
+
+        if not is_init:
+            fp8_context = transformer_engine.pytorch.fp8_autocast(
                     enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
                 )
-            else:
-                import inspect
+        else:
+            context_args = {"enabled": True}
+            if _fp8_model_init_has_recipe:
+                context_args["recipe"] = fp8_recipe
+            if _fp8_model_init_has_preserve:
+                context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
+            fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
-                context_args = {"enabled": True}
-                # Check if fp8_model_init supports setting recipe
-                if "recipe" in (
-                    inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
-                ):
-                    context_args["recipe"] = fp8_recipe
-                # Check if fp8_model_init supports preserve_high_precision_init_val
-                if "preserve_high_precision_init_val" in (
-                    inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
-                ):
-                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
-                fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
-
-            # First / last layer in bf16 isn't supported with delayed scaling since it
-            # requires entering/exiting fp8 context per layer, causing incorrect amax
-            # reduction behavior.
-            assert not (
-                config.first_last_layers_bf16 and isinstance(fp8_recipe, TEDelayedScaling)
-            ), "Delayed scaling does not support first / last layer in BF16."
-
+        if _is_selective_fp8_config(config):
+            allowed_ub_names = _get_allowed_ub_names_from_config(config)
+            return _SelectiveFp8Context(fp8_context, is_init=is_init,
+                                        allowed_ub_names=allowed_ub_names)
         return fp8_context
 
 else:

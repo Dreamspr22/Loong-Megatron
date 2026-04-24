@@ -236,6 +236,13 @@ class TENorm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
+        from megatron.core.transformer.module import restore_fp16module_inputs_to_fp32
+
+        restore_fp16module_inputs_to_fp32(
+            instance, config, 
+            weight_is_fp32=lambda module: module.weight.dtype == torch.float32
+        )
+
         return instance
 
 
@@ -989,6 +996,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        # cu_seqlens_cpu used by linear attention. TE's DotProductAttention does not accept it.
+        self.kept_packed_seq_params.discard("cu_seqlens_cpu")
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -1040,8 +1050,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
+        has_padding_attn_mask = (
+            attention_mask is not None and
+            (
+                attention_mask.any() and attention_mask.dim() == 4 and attention_mask.shape[-2] == 1
+                if not isinstance(attention_mask, (tuple, list))
+                else any(
+                    mask is not None and mask.any() and mask.dim() == 4 and mask.shape[-2] == 1
+                    for mask in attention_mask
+                )
+            )
+        )
         if self.te_forward_mask_type:
-            if qkv_format == "thd" and is_te_min_version("1.7.0"):
+            if (qkv_format == "thd" and is_te_min_version("1.7.0")) or has_padding_attn_mask:
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
                 # so the only acceptable mask types are `padding_causal` and `padding`. These do not
                 # necessarily indicate there are padded tokens in the sequence.
@@ -2116,3 +2137,11 @@ def set_save_original_input(module):
             "set_save_original_input is only needed on transformer-engine modules that save "
             "quantized tensors by default. It needs transformer-engine>=2.6.0dev0."
         )
+
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch import cpu_offload
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+except ImportError:
+    Float8Tensor = None
+    cpu_offload = None

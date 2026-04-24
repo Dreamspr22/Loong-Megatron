@@ -107,7 +107,15 @@ class GPTDataset(MegatronDataset):
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
-        except Exception:
+            assert self._pad_token_id not in (self.config.tokenizer.eos, self.config.tokenizer.eod), (
+                f"the pad token {self._pad_token_id} cannot be either the eod nor the eos",
+            )
+        except Exception as e:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Failed to get the pad token id from the tokenizer: {e}. Using default value {_PAD_TOKEN_ID}",
+            )
             self._pad_token_id = _PAD_TOKEN_ID
 
         (self.document_index, self.sample_index, self.shuffle_index) = (

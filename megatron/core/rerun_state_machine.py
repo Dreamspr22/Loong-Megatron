@@ -1049,6 +1049,10 @@ class RerunDataIterator:
         self.replaying: bool = False
         self.replay_pos: int = 0
 
+    def __iter__(self) -> "RerunDataIterator":
+        """__iter__ method to make RerunDataIterator compatible with iter-based protocols."""
+        return self
+
     def __next__(self) -> Any:
         """__next__ method override adding replay capability."""
 
@@ -1092,6 +1096,83 @@ class RerunDataIterator:
         self.replaying = state_dict["replaying"]
         self.replay_pos = state_dict["replay_pos"]
 
+
+class ChunkDataIterator(RerunDataIterator):
+    """A wrapper class for data iterators that split sequence into chunks
+
+    Args:
+        iterable: data iterator that needs the replay capability.
+        num_chunks: num of chunks each origin batch splitted into
+    """
+    current_chunks: list = None
+    current_chunk_index: int = 0
+    num_chunks: int = 0
+
+    def __init__(self, num_chunks: int, iterable: Iterable[Any]):
+        super().__init__(iterable)
+        self.current_chunk_index = 0
+        self.current_chunks = []
+        self.num_chunks = num_chunks
+
+    def __next__(self):
+        """return next chunk"""
+        if self.current_chunk_index >= self.num_chunks:
+            self.current_chunk_index = 0
+            self.current_chunks = []
+
+        if len(self.current_chunks) == 0:
+            # current chunks is 0, should read next batch
+            self.current_chunks = self.split_batch_into_chunks(super().__next__())
+
+        chunk = self.current_chunks[self.current_chunk_index]
+        self.current_chunk_index += 1
+        return chunk
+
+    def get_next_chunk(self):
+        """return current chunk"""
+        if self.current_chunk_index >= self.num_chunks:
+            return None
+
+        assert len(self.current_chunks) == self.num_chunks, "should call next before get_next_chunk"
+        return self.current_chunks[self.current_chunk_index]
+
+    def split_batch_into_chunks(self, batch):
+        """
+            split origin batch into chunks
+        """
+        if not isinstance(batch, dict):
+            # current only support dict for batch
+            raise ValueError(f"Unsupported batch type: {type(batch)}")
+
+        # split tensor according to sequence
+        chunks = []
+        for i in range(self.num_chunks):
+            chunk = {}
+            for key, value in batch.items():
+                chunk_dim = 1
+                if key == 'attention_mask':
+                    chunk_dim = 2
+
+                if isinstance(value, torch.Tensor):
+                    if value.dim() <= chunk_dim:
+                        raise ValueError(f"dim for {key} <= chunk_dim {chunk_dim}")
+                    dim_size = value.size(chunk_dim)
+                    if dim_size % self.num_chunks != 0:
+                        raise ValueError(f"dim size {dim_size} cannot divided by {self.num_chunks}, key {key}")
+
+                    chunk_size = dim_size // self.num_chunks
+                    start_idx = i * chunk_size
+                    end_idx = (i + 1) * chunk_size
+                    if chunk_dim == 1:
+                        chunk[key] = value[:, start_idx:end_idx]
+                    elif chunk_dim == 2:
+                        chunk[key] = value[:, :, start_idx:end_idx]
+                else:
+                    chunk[key] = value
+
+            chunks.append(chunk)
+
+        return chunks
 
 class QuickStats:
     """Simple class to keep track of distribution of a statistic.

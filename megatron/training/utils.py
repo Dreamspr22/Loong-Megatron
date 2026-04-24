@@ -10,6 +10,7 @@ from datetime import datetime
 from collections import defaultdict
 
 import torch
+from megatron.core.rerun_state_machine import ChunkDataIterator
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
@@ -500,8 +501,140 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator):
+def get_next_batch_on_this_tp_rank(data_iterator):
+    """get next batch for tp rank"""
 
+    args = get_args()
+
+    def _broadcast(item):
+       if item is not None:
+           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(),
+                                       group=mpu.get_tensor_model_parallel_group())
+
+    if mpu.get_tensor_model_parallel_rank() == 0:
+       is_none = False
+       if data_iterator is None:
+           is_none = True
+       elif not isinstance(data_iterator, ChunkDataIterator):
+           is_none = True
+
+       if not is_none:
+           data = data_iterator.get_next_chunk()
+           if data is None:
+               is_none = True
+       item_exist = torch.tensor(1 if is_none else 0, dtype=torch.int32, device='cuda')
+       _broadcast(item_exist)
+       if is_none:
+           return None
+
+       # if enable chunkpipe, it means that seq-length is larger, we should not let dataloader to
+       # create attention mask, because attention mask shape is [1, 1, seq-length, seq-length], 
+       # it will lead to OUTOF memory;
+       # generate attention mask before self attention; 
+       fake_mask = torch.tensor(1, dtype=torch.int32, device='cuda')
+       batch = {
+                    'tokens': data["tokens"].cuda(non_blocking=True),
+                    'labels': data["labels"].cuda(non_blocking=True),
+                    'loss_mask': data["loss_mask"].cuda(non_blocking=True),
+                    'attention_mask': fake_mask,
+                    'position_ids': data["position_ids"].cuda(non_blocking=True)
+               }
+
+       if args.pipeline_model_parallel_size == 1:
+           _broadcast(batch['tokens'])
+           _broadcast(batch['labels'])
+           _broadcast(batch['loss_mask'])
+           _broadcast(batch['attention_mask'])
+           _broadcast(batch['position_ids'])
+
+       elif mpu.is_pipeline_first_stage():
+           _broadcast(batch['tokens'])
+           _broadcast(batch['attention_mask'])
+           _broadcast(batch['position_ids'])
+
+       elif mpu.is_pipeline_last_stage():
+           if args.num_nextn_predict_layers > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
+               _broadcast(batch['tokens'])
+           _broadcast(batch['labels'])
+           _broadcast(batch['loss_mask'])
+           _broadcast(batch['attention_mask'])
+
+    else:
+       tmp_seq_length = args.seq_length
+       if args.enable_chunkpipe:
+           tmp_seq_length = args.chunksize
+
+       item_exist = torch.tensor(0, dtype=torch.int32, device='cuda')
+       _broadcast(item_exist)
+       if item_exist.item() == 1:
+           return None
+       tokens = torch.empty((args.micro_batch_size, tmp_seq_length),
+                            dtype=torch.int64, device=torch.cuda.current_device())
+       labels = torch.empty((args.micro_batch_size, tmp_seq_length),
+                            dtype=torch.int64, device=torch.cuda.current_device())
+       loss_mask = torch.empty((args.micro_batch_size, tmp_seq_length),
+                             dtype=torch.float32, device=torch.cuda.current_device())
+       # if enable chunkpipe, it means that seq-length is larger, we should not let dataloader to
+       # create attention mask, because attention mask shape is [1, 1, seq-length, seq-length], 
+       # it will lead to OUTOF memory;
+       # generate attention mask before self attention; 
+       attention_mask = torch.tensor(0, dtype=torch.int32, device='cuda')
+       position_ids = torch.empty((args.micro_batch_size, tmp_seq_length),
+                                  dtype=torch.int64 , device=torch.cuda.current_device())
+
+       if args.pipeline_model_parallel_size == 1:
+           _broadcast(tokens)
+           _broadcast(labels)
+           _broadcast(loss_mask)
+           _broadcast(attention_mask)
+           _broadcast(position_ids)
+
+       elif mpu.is_pipeline_first_stage():
+           labels = None
+           loss_mask = None
+
+           _broadcast(tokens)
+           _broadcast(attention_mask)
+           _broadcast(position_ids)
+
+       elif mpu.is_pipeline_last_stage():
+           if args.num_nextn_predict_layers > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
+               _broadcast(tokens)
+           else:
+               tokens = None
+           position_ids = None
+
+           _broadcast(labels)
+           _broadcast(loss_mask)
+           _broadcast(attention_mask)
+
+       batch = {
+           'tokens': tokens,
+           'labels': labels,
+           'loss_mask': loss_mask,
+           'attention_mask': attention_mask,
+           'position_ids': position_ids
+       }
+
+    return batch
+
+def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+    """
+    Build and broadcast a micro-batch on the current tensor parallel rank.
+
+    Args:
+        data_iterator: Iterator that yields batch data on TP rank 0.
+        mtp_on_this_rank (bool): Whether Multi-Token Prediction (MTP)
+            logic is enabled on this rank.
+
+    Returns:
+        dict: A batch dictionary containing:
+            - tokens (Tensor or None)
+            - labels (Tensor or None)
+            - loss_mask (Tensor or None)
+            - attention_mask (Tensor or None)
+            - position_ids (Tensor or None)
+    """
     args = get_args()
 
     def _broadcast(item):
@@ -516,19 +649,27 @@ def get_batch_on_this_tp_rank(data_iterator):
 
         assert data_iterator is not None
         data = next(data_iterator)
+
+        tmp_mask = None
+        if args.enable_chunkpipe:
+            # if enable chunkpipe, it means that seq-length is larger, we should not let dataloader to
+            # create attention mask, because attention mask shape is [1, 1, seq-length, seq-length], 
+            # it will lead to OUTOF memory;
+            # generate attention mask before self attention; 
+            tmp_mask = torch.tensor(1, dtype=torch.int32, device='cuda')
+        else:
+            if "attention_mask" in data:
+                tmp_mask = data["attention_mask"].cuda(non_blocking=True)
+
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
             'loss_mask': data["loss_mask"].cuda(non_blocking=True),
-            'attention_mask': (
-                None
-                if "attention_mask" not in data
-                else data["attention_mask"].cuda(non_blocking=True)
-            ),
-            'position_ids': data["position_ids"].cuda(non_blocking=True),
+            'attention_mask': tmp_mask,
+            'position_ids': data["position_ids"].cuda(non_blocking=True)
         }
 
-        if args.pipeline_model_parallel_size == 1:
+        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
@@ -544,45 +685,54 @@ def get_batch_on_this_tp_rank(data_iterator):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(batch['tokens'])
-                _broadcast(batch['position_ids'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
     else:
+        tmp_seq_length = args.seq_length
+        if args.enable_chunkpipe:
+           tmp_seq_length = args.chunksize
 
         tokens = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, tmp_seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         labels = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, tmp_seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         loss_mask = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, tmp_seq_length),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
-        if args.create_attention_mask_in_dataloader:
-            attention_mask = torch.empty(
-                (args.micro_batch_size, 1, args.seq_length, args.seq_length),
-                dtype=torch.bool,
-                device=torch.cuda.current_device(),
-            )
+
+        if args.enable_chunkpipe:
+            # if enable chunkpipe, it means that seq-length is larger, we should not let dataloader to
+            # create attention mask, because attention mask shape is [1, 1, seq-length, seq-length], 
+            # it will lead to OUTOF memory;
+            # generate attention mask before self attention; 
+            attention_mask = torch.tensor(0, dtype=torch.int32, device='cuda')
         else:
-            attention_mask = None
+            if args.create_attention_mask_in_dataloader:
+                attention_mask = torch.empty(
+                    (args.micro_batch_size, 1, tmp_seq_length, args.seq_length),
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device()
+                )
+            else:
+                attention_mask = None
+
         position_ids = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, tmp_seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
 
-        if args.pipeline_model_parallel_size == 1:
+        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
@@ -601,12 +751,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(tokens)
-                _broadcast(position_ids)
-            else:
-                tokens = None
-                position_ids = None
+            tokens = None
+            position_ids = None
 
             _broadcast(labels)
             _broadcast(loss_mask)
