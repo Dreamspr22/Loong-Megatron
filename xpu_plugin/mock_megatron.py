@@ -38,6 +38,120 @@ class MockMixedFusedLayerNorm(TorchLayerNorm):
         setattr(self.bias, "sequence_parallel", self.sequence_parallel)
 
 
+def mock_bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
+    """
+    mock_bias_swiglu_impl
+    """
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3]
+    assert not fp8_input_store
+    input = input.view(-1, ori_shape[-1])
+
+    if bias is not None:
+        input = input + bias
+    
+    if cpu_offload_input:
+        input.activation_offloading = True
+        if bias is not None:
+            bias.activation_offloading = True
+
+    from torch_xmlir.nn.swiglu import SwiGLUFunction
+
+    output = SwiGLUFunction.apply(input)
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
+class MockWeightedSwiGLUFunction(torch.autograd.Function):
+    """Weighted SwiGLU with bias support for XPU.
+
+    Computes: swiglu(input + bias) * weights
+
+    Optimizations over the original WeightedSwiGLUFunction:
+    1. Uses xmlir's fused swiglu_forward/swiglu_backward custom ops
+    2. Saves swiglu output in forward to avoid recomputation in backward
+    3. Supports bias != None (original raises NotImplementedError)
+    """
+
+    @staticmethod
+    def forward(ctx, input, bias, weights, fp8_input_store):
+        """
+        forward
+        """
+        assert not fp8_input_store, "fp8_input_store is not supported on XPU"
+
+        if bias is not None:
+            input = input + bias
+
+        # Ensure xmlir custom ops are registered
+        from torch_xmlir.nn.swiglu import SwiGLUFunction  # noqa: F401
+
+        # Use xmlir's fused swiglu_forward directly (no autograd overhead)
+        output_shape = list(input.shape)
+        output_shape[-1] = input.shape[-1] // 2
+        output = input.new_empty(output_shape)
+
+        if input.numel() > 0:
+            torch.ops.custom_ops.swiglu_forward(input, -1, True, out=output)
+
+        ctx.save_for_backward(input, weights, output)
+        ctx.has_bias = bias is not None
+        ctx.ori_input_dtype = input.dtype
+
+        return (output * weights).to(input.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        backward
+        """
+        input, weights, output = ctx.saved_tensors
+
+        # d_weights: sum(swiglu_output * grad_output) over hidden dim
+        # Compute in weights' precision for accuracy (matches original weighted_swiglu_back)
+        grad_weights = torch.sum(
+            output * grad_output.to(output.dtype), dim=-1, keepdim=True
+        ).to(weights.dtype)
+
+        # d_input via swiglu backward
+        # Chain rule: d_input = swiglu_backward(grad_output * weights, input)
+        # Compute grad_swiglu in higher precision, then cast for swiglu_backward
+        grad_swiglu = (grad_output.to(weights.dtype) * weights).to(input.dtype)
+
+        d_input = input.new_empty(input.shape)
+        if input.numel() > 0:
+            torch.ops.custom_ops.swiglu_backward(
+                input, grad_swiglu, -1, True, dx=d_input
+            )
+
+        # d_bias = d_input (same as bias_swiglu_impl)
+        if ctx.has_bias:
+            return d_input, d_input, grad_weights, None
+        else:
+            return d_input, None, grad_weights, None
+
+
+def mock_weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+    """Token-wise-weighted bias swiglu fusion for XPU.
+
+    Computes: swiglu(input + bias) * weights
+
+    Uses xmlir's optimized SwiGLU custom ops for XPU performance.
+    Unlike the original implementation, this also supports bias != None.
+    """
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3]
+    assert not fp8_input_store
+    input = input.view(-1, ori_shape[-1])
+
+    # Reshape weights to be broadcastable with 2D input
+    # weights may be [s, b, 1] when input is 3D, need [s*b, 1]
+    if weights.dim() > 2:
+        weights = weights.view(-1, weights.shape[-1])
+
+    output = MockWeightedSwiGLUFunction.apply(input, bias, weights, fp8_input_store)
+
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
 class MockGeLUFunction(torch.autograd.Function):
     """
     MockGeLUFunction
@@ -62,31 +176,7 @@ class MockGeLUFunction(torch.autograd.Function):
         out = ctx.saved_tensors[0]
         tmp = torch.ops.aten.gelu_backward(grad_output, out)
         return tmp, tmp
-
-
-def mock_bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
-    """
-    mock_bias_swiglu_impl
-    """
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    assert not fp8_input_store
-    input = input.view(-1, ori_shape[-1])
-
-    if bias is not None:
-        input = input + bias
     
-    if cpu_offload_input:
-        input.activation_offloading = True
-        if bias is not None:
-            bias.activation_offloading = True
-
-    from torch_xmlir.nn.swiglu import SwiGLUFunction
-
-    output = SwiGLUFunction.apply(input)
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
-
-
 mock_bias_gelu_impl = MockGeLUFunction.apply
 
 

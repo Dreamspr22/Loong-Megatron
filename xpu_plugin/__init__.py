@@ -115,12 +115,22 @@ def init_megatron_core_xpu_plugin():
     )
     replace_symbol("megatron.legacy.model.LayerNorm", mock_megatron.MockMixedFusedLayerNorm)
     replace_symbol("megatron.legacy.fused_kernels.load", empty_package.empty_function)
+
     replace_symbol(
         "megatron.core.transformer.mlp.bias_swiglu_impl", mock_megatron.mock_bias_swiglu_impl
     )
     replace_symbol(
+        "megatron.core.transformer.mlp.weighted_bias_swiglu_impl",
+        mock_megatron.mock_weighted_bias_swiglu_impl,
+    )
+    replace_symbol(
+        "megatron.core.transformer.moe.experts.weighted_bias_swiglu_impl",
+        mock_megatron.mock_weighted_bias_swiglu_impl,
+    )
+    replace_symbol(
         "megatron.legacy.model.fused_bias_gelu.bias_gelu_impl", mock_megatron.mock_bias_gelu_impl
     )
+    replace_symbol("megatron.legacy.model.fused_bias_gelu.bias_gelu", mock_megatron.mock_bias_gelu)
     replace_symbol(
         "megatron.core.tensor_parallel.mappings._gather_along_first_dim",
         mock_megatron.mock_gather_along_first_dim,
@@ -133,7 +143,6 @@ def init_megatron_core_xpu_plugin():
         "megatron.legacy.model.fused_softmax.FusedScaleMaskSoftmax.is_kernel_available",
         mock_megatron.mock_is_kernel_available,
     )
-    replace_symbol("megatron.legacy.model.fused_bias_gelu.bias_gelu", mock_megatron.mock_bias_gelu)
     replace_symbol(
         "megatron.core.transformer.moe.token_dispatcher.unpermute", mock_megatron.mock_unpermute
     )
